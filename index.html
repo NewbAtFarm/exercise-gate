@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#0a0c10">
+<!-- 오류 153 방지: 유튜브가 임베드한 사이트를 식별하려면 리퍼러가 필요하다 -->
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="mobile-web-app-capable" content="yes">
+<title>운동 게이트 프로토타입</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+
+<!-- YT API가 모듈 스크립트보다 먼저 준비될 수 있으므로, 콜백을 미리 선점해 둔다 -->
+<script>
+  window.__ytReady = new Promise(function (res) { window.onYouTubeIframeAPIReady = res; });
+</script>
+<script src="https://www.youtube.com/iframe_api"></script>
+
+<style>
+/* 레이아웃: 가로 전용 2단. 플레이어가 남는 폭을 전부 먹고, 패널이 우측에 떠서 조금만 겹친다. */
+:root{
+  --panel-w: 22%;
+  --overlap: 30px;
+
+  --bg:#0a0c10;
+  --panel:#141821e6;
+  --panel-solid:#141821;
+  --line:#2a3140;
+  --fg:#e7ecf5;
+  --dim:#8b96ab;
+  --accent:#4ade80;
+  --warn:#fbbf24;
+  --stop:#f4505a;
+  --track:#232a37;
+
+  --font: ui-sans-serif, -apple-system, "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--fg);
+  font-family:var(--font);-webkit-text-size-adjust:100%;overscroll-behavior:none}
+body{color-scheme:dark}
+
+/* ---------- 세로일 때 회전 안내 ---------- */
+#rotate{display:none;position:fixed;inset:0;z-index:100;background:var(--bg);
+  flex-direction:column;align-items:center;justify-content:center;gap:18px;text-align:center;
+  padding-left:max(24px,env(safe-area-inset-left,0px));padding-right:max(24px,env(safe-area-inset-right,0px))}
+#rotate svg{width:72px;height:72px;stroke:var(--accent);fill:none;stroke-width:1.6}
+#rotate h1{margin:0;font-size:1.25rem;font-weight:650}
+#rotate p{margin:0;color:var(--dim);font-size:.9rem;line-height:1.6}
+@media (orientation:portrait){
+  #rotate{display:flex}
+  #stage{visibility:hidden}
+}
+
+/* ---------- 무대 ---------- */
+#stage{position:fixed;inset:0}
+
+/* 플레이어: 패널 왼쪽 경계까지 + 겹침만큼 더 뻗는다 */
+#playerWrap{position:absolute;left:0;top:0;bottom:0;
+  right:calc(var(--panel-w) - var(--overlap));background:#000;overflow:hidden}
+#playerWrap iframe{width:100%;height:100%;border:0;display:block}
+
+/* 패널: 플레이어 위에 떠 있는 유일한 오버레이.
+   stage에 전면 래퍼를 두지 않으므로 패널 바깥 포인터 이벤트는 그대로 플레이어로 간다. */
+#panel{position:absolute;right:0;top:0;bottom:0;width:var(--panel-w);
+  z-index:10;display:flex;flex-direction:column;
+  background:var(--panel);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border:2px solid var(--line);border-radius:16px 0 0 16px;border-right:0;
+  box-shadow:-10px 0 30px #0009;
+  overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;
+  padding:10px 10px calc(10px + env(safe-area-inset-bottom,0px));
+  padding-top:calc(10px + env(safe-area-inset-top,0px));
+  padding-right:calc(10px + env(safe-area-inset-right,0px));
+  gap:10px;
+  transition:border-color .12s linear}
+#panel.state-warn{border-color:var(--warn)}
+#panel.state-stop{border-color:var(--stop)}
+@media (prefers-reduced-motion:no-preference){
+  #panel.state-warn{animation:flash .46s steps(1,end) infinite}
+  #panel.state-stop{animation:flashHard .7s steps(1,end) infinite}
+}
+@keyframes flash{0%,49%{border-color:var(--warn)}50%,100%{border-color:var(--line)}}
+@keyframes flashHard{0%,49%{border-color:var(--stop)}50%,100%{border-color:#5a1f24}}
+
+/* ---------- 카메라 ---------- */
+#camBox{position:relative;width:100%;background:#05070a;border-radius:10px;overflow:hidden;
+  border:1px solid var(--line);aspect-ratio:4/3;flex:none}
+/* 거울 반전. video와 canvas를 함께 뒤집어 좌표계를 일치시킨다. */
+#camBox>*{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1)}
+#cam{object-fit:contain;background:#05070a}   /* 잘라내지 않음: 전신 프레이밍 확인용 */
+#overlay{pointer-events:none}
+#camBadge{position:absolute;left:0;bottom:0;top:auto;right:auto;transform:none;width:auto;height:auto;
+  font:600 9px/1 var(--mono);color:var(--dim);background:#05070ac8;padding:3px 5px;border-radius:0 6px 0 0}
+
+/* ---------- 상태 ---------- */
+#stateBox{text-align:center;padding:8px 6px;border-radius:10px;background:#0d1016;border:1px solid var(--line);flex:none}
+#stateText{font-size:clamp(.95rem,1.7vw,1.3rem);font-weight:700;letter-spacing:-.01em;line-height:1.15}
+#idleText{margin-top:3px;font:600 clamp(1.5rem,3.4vw,2.4rem)/1 var(--mono);font-variant-numeric:tabular-nums}
+#idleCap{font-size:.62rem;color:var(--dim);letter-spacing:.06em;text-transform:uppercase;margin-top:3px}
+.s-run #stateText{color:var(--accent)} .s-warn #stateText{color:var(--warn)}
+.s-stop #stateText{color:var(--stop)}  .s-none #stateText{color:var(--dim)}
+
+/* ---------- 게이지 ---------- */
+.gauge{flex:none}
+.gRow{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;gap:4px}
+.gRow b{font:600 .92rem/1 var(--mono);font-variant-numeric:tabular-nums}
+.gLabel{font-size:.64rem;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
+#gTrack{position:relative;height:16px;background:var(--track);border-radius:8px;overflow:hidden}
+#gFill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--accent);
+  border-radius:8px;transition:width .08s linear}
+#gFill.under{background:var(--dim)}
+#gMark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--fg);box-shadow:0 0 0 1px #0008}
+#gMeta{display:flex;justify-content:space-between;margin-top:3px;
+  font:500 .62rem/1 var(--mono);color:var(--dim);font-variant-numeric:tabular-nums}
+
+/* ---------- 계측 ---------- */
+#stats{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:10px;overflow:hidden;flex:none}
+#stats div{background:#0d1016;padding:5px 6px;min-width:0}
+#stats span{display:block;font-size:.58rem;color:var(--dim);letter-spacing:.05em;text-transform:uppercase}
+#stats b{font:600 .8rem/1.3 var(--mono);font-variant-numeric:tabular-nums;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+#stats .wide{grid-column:1/-1}
+
+/* ---------- 컨트롤 ---------- */
+.sec{flex:none}
+#ytErr{flex:none;font-size:.64rem;line-height:1.5;color:var(--stop);
+  background:#2a1115;border:1px solid #5a1f24;border-radius:8px;padding:6px 8px}
+#tabs{display:flex;gap:3px;padding-top:7px;border-top:1px solid var(--line);flex:none}
+.tab{flex:1 1 0;padding:6px 2px;min-height:30px;font-size:.68rem;background:#0d1016;
+  border:1px solid var(--line);border-radius:7px}
+.tab.on{background:#232c3d;border-color:#3d4a63;color:var(--fg)}
+.ctl{margin-bottom:8px}
+.ctl label{display:flex;justify-content:space-between;align-items:baseline;gap:4px;
+  font-size:.68rem;color:var(--dim);margin-bottom:3px}
+.ctl label b{color:var(--fg);font:600 .72rem/1 var(--mono);font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;height:22px;margin:0;background:transparent;-webkit-appearance:none;appearance:none;display:block}
+input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+input[type=range]::-webkit-slider-runnable-track{height:4px;background:var(--track);border-radius:2px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;margin-top:-7px;
+  border-radius:50%;background:var(--fg);border:0;box-shadow:0 1px 4px #000a}
+input[type=range]::-moz-range-track{height:4px;background:var(--track);border-radius:2px}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--fg);border:0}
+
+.vidRow{display:flex;gap:5px;flex-wrap:wrap}
+button{font-family:inherit;font-size:.7rem;font-weight:600;color:var(--fg);
+  background:#1c2230;border:1px solid var(--line);border-radius:7px;padding:6px 9px;
+  cursor:pointer;min-height:32px;flex:1 1 auto;min-width:0}
+button:hover{background:#242b3b}
+button.on{background:var(--accent);border-color:var(--accent);color:#06130c}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#idForm{display:flex;gap:5px;margin-top:6px}
+#idInput{flex:1 1 auto;min-width:0;font:500 .7rem var(--mono);color:var(--fg);
+  background:#0d1016;border:1px solid var(--line);border-radius:7px;padding:6px 7px}
+#idInput:focus-visible{outline:2px solid var(--accent);outline-offset:-1px}
+#nowPlaying{margin-top:7px;font-size:.64rem;color:var(--fg);line-height:1.4;
+  background:#0d1016;border:1px solid var(--line);border-radius:7px;padding:6px 8px;
+  overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+#note{font-size:.6rem;color:var(--dim);line-height:1.5;padding-bottom:4px}
+#note b{color:#aab6c9}
+#note code{font-family:var(--mono);color:#aab6c9}
+
+/* ---------- 시작 게이트 ---------- */
+#gate{position:fixed;inset:0;z-index:50;background:#070910f2;display:flex;
+  flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;
+  padding-left:max(24px,env(safe-area-inset-left,0px));padding-right:max(24px,env(safe-area-inset-right,0px))}
+#gate h1{margin:0;font-size:clamp(1.1rem,2.4vw,1.6rem);font-weight:700;letter-spacing:-.015em}
+#gate p{margin:0;max-width:46ch;color:var(--dim);font-size:.82rem;line-height:1.65}
+#startBtn{flex:none;font-size:1rem;padding:13px 34px;min-height:52px;
+  background:var(--accent);border-color:var(--accent);color:#06130c}
+#startBtn:hover{background:#6ee79b}
+#startBtn[disabled]{opacity:.55;cursor:default}
+#gateErr{color:var(--stop);font-size:.78rem;max-width:52ch;line-height:1.6;min-height:1.2em}
+</style>
+</head>
+<body>
+
+<div id="rotate">
+  <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2" y="7" width="20" height="10" rx="2"/><path d="M7 3.5 9.5 6 7 8.5"/>
+  </svg>
+  <h1>가로로 돌려주세요</h1>
+  <p>가로 모드 전용입니다.<br>태블릿을 눕히면 바로 시작됩니다.</p>
+</div>
+
+<div id="stage">
+  <div id="playerWrap"><div id="player"></div></div>
+
+  <aside id="panel" class="s-none">
+    <div id="camBox">
+      <video id="cam" playsinline muted autoplay></video>
+      <canvas id="overlay"></canvas>
+      <div id="camBadge">—</div>
+    </div>
+
+    <div id="stateBox">
+      <div id="stateText">대기</div>
+      <div id="idleText">0.0</div>
+      <div id="idleCap">정지 경과 (초)</div>
+    </div>
+
+    <div class="gauge">
+      <div class="gRow"><span class="gLabel">움직임 에너지</span><b id="eNow">—</b></div>
+      <div id="gTrack"><div id="gFill" class="under"></div><div id="gMark"></div></div>
+      <div id="gMeta"><span>임계 <b id="eThr">50</b></span><span>5초 최대 <b id="ePeak">—</b></span></div>
+    </div>
+
+    <div id="stats">
+      <div><span>루프 fps</span><b id="sLoop">—</b></div>
+      <div><span>추론 fps</span><b id="sInfFps">—</b></div>
+      <div><span>추론 시간</span><b id="sMs">—</b></div>
+      <div><span>델리게이트</span><b id="sDel">—</b></div>
+      <div class="wide"><span>판정 입력 (원본 전체 프레임)</span><b id="sRes">—</b></div>
+    </div>
+
+    <div id="tabs" role="tablist">
+      <button class="tab on" data-t="tune" type="button">판정</button>
+      <button class="tab" data-t="layout" type="button">레이아웃</button>
+      <button class="tab" data-t="vid" type="button">영상</button>
+    </div>
+
+    <div id="ytErr" hidden></div>
+
+    <div class="sec" data-p="tune">
+      <div class="ctl"><label for="cThr">움직임 임계값 <b id="vThr">50</b></label>
+        <input type="range" id="cThr" min="5" max="300" step="5" value="50"></div>
+      <div class="ctl"><label for="cWarn">경고 시간 <b id="vWarn">5.0초</b></label>
+        <input type="range" id="cWarn" min="1" max="20" step="0.5" value="5"></div>
+      <div class="ctl"><label for="cStop">정지 시간 <b id="vStop">10.0초</b></label>
+        <input type="range" id="cStop" min="2" max="40" step="0.5" value="10"></div>
+      <div class="ctl"><label for="cInt">추론 간격 <b id="vInt">3프레임마다</b></label>
+        <input type="range" id="cInt" min="1" max="8" step="1" value="3"></div>
+    </div>
+
+    <div class="sec" data-p="layout" hidden>
+      <div class="ctl"><label for="cPanel">패널 폭 <b id="vPanel">22%</b></label>
+        <input type="range" id="cPanel" min="14" max="40" step="1" value="22"></div>
+      <div class="ctl"><label for="cOver">겹침 <b id="vOver">30px</b></label>
+        <input type="range" id="cOver" min="0" max="80" step="2" value="30"></div>
+    </div>
+
+    <div class="sec" data-p="vid" hidden>
+      <div class="vidRow" id="vidRow"></div>
+      <form id="idForm"><input id="idInput" placeholder="ID 또는 URL 붙여넣기" inputmode="url"
+        autocomplete="off" spellcheck="false"><button type="submit" style="flex:0 0 auto">열기</button></form>
+      <div id="nowPlaying">재생 중: —</div>
+      <div id="note" style="padding-top:7px">
+        유튜브 앱에서 <b>공유 → 링크 복사</b> 후 위 칸에 붙여넣고 엔터.<br>
+        임베드가 차단된 영상은 재생되지 않으니 아이가 보는 영상으로 꼭 확인하세요.
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div id="gate">
+  <h1>운동 게이트 프로토타입</h1>
+  <p>카메라로 움직임만 봅니다. 영상은 기기 밖으로 나가지 않고, 포즈 추정도 전부 이 태블릿 안에서 돌아갑니다.
+     시작을 누르면 카메라 권한을 묻습니다.</p>
+  <button id="startBtn">시작</button>
+  <div id="gateErr"></div>
+</div>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/vision_bundle.mjs";
+
+/* ============================================================
+   아이가 보는 영상으로 교체하세요. 임베드 허용된 ID만 재생됩니다.
+   아래 둘은 동작 확인용 공개 클립입니다.
+   ============================================================ */
+const VIDEO_IDS = [
+  "aqz-KE-bpKQ",   // Big Buck Bunny (10분, 긴 테스트용)
+  "jNQXAC9IVRw",   // Me at the zoo (19초, 짧은 확인용)
+];
+
+const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm";
+// 오프라인으로 쓰려면 .task 파일을 index.html 옆에 두고 "./pose_landmarker_lite.task" 로 바꾸세요.
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+const VIS_MIN   = 0.5;   // 이 미만의 관절점은 에너지 계산에서 제외
+const EMA       = 0.45;  // 에너지 평활 계수
+const TICK_MS   = 100;   // 판정 주기 (추론 주기와 분리)
+const BEEP_MS   = 1200;  // 경고음 최소 간격
+const RESUME_N  = 2;     // 재생 재개에 필요한 연속 초과 횟수 (노이즈로 인한 play/pause 떨림 방지)
+
+const $ = (id) => document.getElementById(id);
+const el = {
+  panel:$("panel"), cam:$("cam"), overlay:$("overlay"), camBadge:$("camBadge"),
+  stateText:$("stateText"), idleText:$("idleText"),
+  eNow:$("eNow"), eThr:$("eThr"), ePeak:$("ePeak"), gFill:$("gFill"), gMark:$("gMark"),
+  sLoop:$("sLoop"), sInfFps:$("sInfFps"), sMs:$("sMs"), sDel:$("sDel"), sRes:$("sRes"),
+  gate:$("gate"), gateErr:$("gateErr"), startBtn:$("startBtn"), vidRow:$("vidRow"),
+};
+
+const S = { thr:50, warn:5, stop:10, interval:3 };
+
+let landmarker=null, player=null, ac=null, wakeLock=null;
+let running=false, rafId=0;
+let lastVideoTime=-1, prevLm=null, prevT=0;
+let energy=null, smooth=null, present=false;
+let peaks=[];                      // 최근 5초 {t,v}
+let state="none";                  // none | run | warn | stop
+let idle=0, aboveCount=0, pausedByUs=false, lastBeep=0, lastTick=0;
+let loopFrames=0, infCount=0, lastFpsT=0, infMs=0, skipN=0;
+let gaugeMax=300;
+
+/* ---------------- 유튜브 ---------------- */
+const YT_ERR = {
+  2:   "영상 ID 형식이 잘못되었습니다.",
+  5:   "HTML5 플레이어 오류입니다.",
+  100: "영상이 없거나 비공개입니다.",
+  101: "영상 소유자가 외부 사이트 재생(임베드)을 막아두었습니다.",
+  150: "영상 소유자가 외부 사이트 재생(임베드)을 막아두었습니다.",
+  153: "유튜브가 이 사이트를 식별하지 못했습니다 (리퍼러 없음).",
+};
+function showYtErr(msg){
+  const d = $("ytErr");
+  if (!msg){ d.hidden = true; return; }
+  d.textContent = msg; d.hidden = false;
+}
+
+async function initPlayer(){
+  await window.__ytReady;
+
+  // YT.Player 가 iframe 을 직접 만들게 두면 origin 과 referrerpolicy 가 빠져서
+  // 유튜브가 임베드한 사이트를 식별하지 못하고 오류 153 을 냅니다.
+  // 그래서 iframe 을 우리가 만들어 두고 거기에 플레이어를 붙입니다.
+  const qs = new URLSearchParams({
+    enablejsapi: "1",
+    fs: "0",                 // 전체화면 버튼 제거 — 패널이 가려지지 않게
+    playsinline: "1", rel: "0", modestbranding: "1", iv_load_policy: "3", controls: "1",
+    origin: location.origin,
+    widget_referrer: location.origin,
+  });
+  const ifr = document.createElement("iframe");
+  ifr.id = "player";
+  ifr.referrerPolicy = "strict-origin-when-cross-origin";
+  ifr.allow = "autoplay; encrypted-media; picture-in-picture";   // fullscreen 은 주지 않는다
+  ifr.setAttribute("frameborder", "0");
+  ifr.src = "https://www.youtube.com/embed/" + VIDEO_IDS[0] + "?" + qs.toString();
+  document.getElementById("player").replaceWith(ifr);
+
+  player = new YT.Player(ifr, {
+    events: {
+      onReady: (e) => { showYtErr(null); try { e.target.playVideo(); } catch(_){} nowPlaying(); },
+      onError: (e) => {
+        showYtErr("플레이어 오류 " + e.data + " — "
+          + (YT_ERR[e.data] || "알 수 없는 오류입니다.")
+          + " 아래 입력란에 다른 영상 주소를 넣어 보세요.");
+      },
+      onStateChange: (e) => {
+        // 아이가 직접 일시정지한 경우는 우리가 다시 틀지 않는다
+        if (e.data === YT.PlayerState.PLAYING){ pausedByUs = false; showYtErr(null); }
+        nowPlaying();
+      },
+    },
+  });
+}
+const playerReady = (fn) => { try { if (player && player[fn]) player[fn](); } catch(_){} };
+
+function buildVidButtons(){
+  el.vidRow.innerHTML = "";
+  VIDEO_IDS.forEach((id, i) => {
+    const b = document.createElement("button");
+    b.textContent = "영상 " + (i+1);
+    b.onclick = () => loadVideo(id, b);
+    el.vidRow.appendChild(b);
+  });
+}
+function nowPlaying(){
+  try {
+    const d = player && player.getVideoData && player.getVideoData();
+    $("nowPlaying").textContent = "재생 중: " + ((d && d.title) ? d.title : "—");
+  } catch (_) {}
+}
+
+function loadVideo(id, btn){
+  try { player && player.loadVideoById(id); } catch(_){}
+  showYtErr(null);
+  pausedByUs = false; idle = 0; setState("run");
+  setTimeout(nowPlaying, 1200);
+  [...el.vidRow.children].forEach(c => c.classList.remove("on"));
+  if (btn) btn.classList.add("on");
+}
+$("idForm").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const raw = $("idInput").value.trim();
+  if (!raw) return;
+  const m = raw.match(/(?:v=|\/shorts\/|\/embed\/|youtu\.be\/)([\w-]{11})/) || raw.match(/^([\w-]{11})$/);
+  if (!m) { $("idInput").value = ""; $("idInput").placeholder = "ID를 못 읽었습니다"; return; }
+  loadVideo(m[1], null);
+  $("idInput").value = ""; $("idInput").blur();
+});
+
+/* ---------------- 카메라 + 모델 ---------------- */
+async function camCount(){
+  try {
+    const d = await navigator.mediaDevices.enumerateDevices();
+    return d.filter((x) => x.kind === "videoinput").length;
+  } catch (_) { return "?"; }
+}
+
+async function initCamera(){
+  const get = (v) => navigator.mediaDevices.getUserMedia({ audio:false, video:v });
+  let stream;
+  try {
+    stream = await get({ width:{ideal:640}, height:{ideal:480}, frameRate:{ideal:30}, facingMode:"user" });
+  } catch (e) {
+    // 노트북 내장 웹캠은 facingMode 를 보고하지 않거나 해상도를 못 맞추는 경우가 있다.
+    // 이럴 때는 제약 없이 아무 카메라나 받는다.
+    if (e && (e.name === "NotFoundError" || e.name === "OverconstrainedError")) stream = await get(true);
+    else throw e;
+  }
+  el.cam.srcObject = stream;
+  await el.cam.play();
+  await new Promise(r => {
+    if (el.cam.videoWidth) return r();
+    el.cam.onloadedmetadata = r;
+  });
+  const w = el.cam.videoWidth, h = el.cam.videoHeight;
+  // 미리보기 박스를 실제 스트림 비율로 맞춘다 → contain 이 레터박스 없이 꽉 찬다
+  $("camBox").style.aspectRatio = w + "/" + h;
+  el.sRes.textContent = w + "x" + h;
+  el.camBadge.textContent = w + "x" + h;
+}
+
+async function initModel(){
+  const vision = await FilesetResolver.forVisionTasks(WASM_BASE);
+  const opts = {
+    baseOptions:{ modelAssetPath: MODEL_URL, delegate:"GPU" },
+    runningMode:"VIDEO",            // 웹 SDK에는 LIVE_STREAM 이 없다. VIDEO + 단조 타임스탬프가 라이브 경로.
+    numPoses:1,
+    outputSegmentationMasks:false,
+  };
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts);
+    el.sDel.textContent = "GPU";
+  } catch (e) {
+    opts.baseOptions.delegate = "CPU";
+    landmarker = await PoseLandmarker.createFromOptions(vision, opts);
+    el.sDel.textContent = "CPU (폴백)";
+  }
+}
+
+/* ---------------- 에너지 ---------------- */
+function computeEnergy(lm, now){
+  if (!prevLm || prevLm.length !== lm.length){ prevLm = lm; prevT = now; return null; }
+  const dt = Math.max((now - prevT) / 1000, 1/120);
+  let sum = 0, n = 0;
+  for (let i = 0; i < lm.length; i++){
+    const a = lm[i], b = prevLm[i];
+    if (!b) continue;
+    if ((a.visibility ?? 1) < VIS_MIN || (b.visibility ?? 1) < VIS_MIN) continue;
+    sum += Math.hypot(a.x - b.x, a.y - b.y);
+    n++;
+  }
+  prevLm = lm; prevT = now;
+  if (n === 0) return null;
+  // 관절점당 평균 이동량을 초당으로 환산 → 추론 간격을 바꿔도 임계값이 흔들리지 않는다
+  return (sum / n) / dt * 1000;
+}
+
+/* ---------------- 관절점 그리기 ---------------- */
+function draw(lm){
+  const c = el.overlay, ctx = c.getContext("2d");
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const bw = c.clientWidth, bh = c.clientHeight;
+  if (!bw || !bh) return;
+  if (c.width !== Math.round(bw*dpr) || c.height !== Math.round(bh*dpr)){
+    c.width = Math.round(bw*dpr); c.height = Math.round(bh*dpr);
+  }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,bw,bh);
+  if (!lm) return;
+
+  // object-fit: contain 의 실제 표시 영역을 계산해 좌표를 맞춘다
+  const vw = el.cam.videoWidth || 4, vh = el.cam.videoHeight || 3;
+  const sc = Math.min(bw/vw, bh/vh);
+  const dw = vw*sc, dh = vh*sc, ox = (bw-dw)/2, oy = (bh-dh)/2;
+  const X = (p) => ox + p.x*dw, Y = (p) => oy + p.y*dh;
+
+  const col = state==="stop" ? "#f4505a" : state==="warn" ? "#fbbf24" : "#4ade80";
+  ctx.lineWidth = 2; ctx.strokeStyle = col; ctx.globalAlpha = .85;
+  ctx.beginPath();
+  for (const cn of PoseLandmarker.POSE_CONNECTIONS){
+    const a = lm[cn.start], b = lm[cn.end];
+    if (!a || !b) continue;
+    if ((a.visibility ?? 1) < VIS_MIN || (b.visibility ?? 1) < VIS_MIN) continue;
+    ctx.moveTo(X(a), Y(a)); ctx.lineTo(X(b), Y(b));
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1; ctx.fillStyle = col;
+  for (const p of lm){
+    if ((p.visibility ?? 1) < VIS_MIN) continue;
+    ctx.beginPath(); ctx.arc(X(p), Y(p), 2.6, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+/* ---------------- 프레임 루프 ---------------- */
+function loop(){
+  rafId = requestAnimationFrame(loop);
+  loopFrames++; skipN++;
+
+  const now = performance.now();
+  if (now - lastFpsT >= 500){
+    const s = (now - lastFpsT) / 1000;
+    el.sLoop.textContent    = (loopFrames/s).toFixed(0);
+    el.sInfFps.textContent  = (infCount/s).toFixed(1);
+    loopFrames = 0; infCount = 0; lastFpsT = now;
+  }
+
+  if (!landmarker || el.cam.readyState < 2) return;
+  if (skipN % S.interval !== 0) return;
+  if (el.cam.currentTime === lastVideoTime) return;   // 같은 프레임 재추론 방지
+  lastVideoTime = el.cam.currentTime;
+
+  let res = null;
+  const t0 = performance.now();
+  try {
+    res = landmarker.detectForVideo(el.cam, t0);       // 타임스탬프는 단조 증가해야 한다
+  } catch (_) { return; }
+  infMs = performance.now() - t0;
+  infCount++;
+  el.sMs.textContent = infMs.toFixed(1) + "ms";
+
+  const lm = (res && res.landmarks && res.landmarks[0]) ? res.landmarks[0] : null;
+  present = !!lm;
+  if (lm){
+    const e = computeEnergy(lm, t0);
+    if (e !== null){
+      energy = e;
+      smooth = (smooth === null) ? e : smooth + EMA*(e - smooth);
+      peaks.push({ t:t0, v:smooth });
+    }
+  } else {
+    prevLm = null; energy = null; smooth = null;   // 프레임 밖 → 정지로 간주
+  }
+  const cut = t0 - 5000;
+  while (peaks.length && peaks[0].t < cut) peaks.shift();
+
+  draw(lm);
+  paintGauge();
+}
+
+/* ---------------- 판정 ---------------- */
+function effStop(){ return Math.max(S.stop, S.warn + 0.5); }
+
+function tick(){
+  if (!running) return;
+  // 경과 시간은 실제 시계로 잰다. setInterval 은 추론 부하로 밀리기 때문에
+  // 호출 횟수를 세면 "10초 정지"가 10초가 아니게 된다. 긴 정지(탭 전환 등)는 잘라낸다.
+  const now = performance.now();
+  const dt = lastTick ? Math.min((now - lastTick) / 1000, 0.5) : TICK_MS / 1000;
+  lastTick = now;
+
+  const moving = present && smooth !== null && smooth >= S.thr;
+
+  if (moving){
+    idle = 0;
+    aboveCount++;
+    if (state === "stop"){
+      if (aboveCount >= RESUME_N && pausedByUs){ playerReady("playVideo"); pausedByUs = false; setState("run"); }
+      else if (!pausedByUs) setState("run");
+    } else setState("run");
+  } else {
+    aboveCount = 0;
+    idle += dt;
+    if (idle >= effStop()){
+      if (state !== "stop"){ playerReady("pauseVideo"); pausedByUs = true; setState("stop"); }
+    } else if (idle >= S.warn){
+      setState("warn");
+      const n = performance.now();
+      if (n - lastBeep > BEEP_MS){ beep(); lastBeep = n; }
+    } else if (state !== "stop") setState("run");
+  }
+
+  el.idleText.textContent = idle.toFixed(1);
+}
+
+function setState(s){
+  if (state === s) return;
+  const prev = state;
+  state = s;
+  el.panel.classList.remove("s-" + prev, "state-warn", "state-stop");
+  el.panel.classList.add("s-" + s);
+  if (s === "warn") el.panel.classList.add("state-warn");
+  if (s === "stop") el.panel.classList.add("state-stop");
+  el.stateText.textContent =
+    s === "run"  ? (present ? "운동중" : "프레임 밖") :
+    s === "warn" ? "경고 — 움직여!" :
+    s === "stop" ? "정지됨" : "대기";
+}
+
+function paintGauge(){
+  const v = smooth;
+  // 임계 마커는 사람이 없을 때도 제자리를 지켜야 한다
+  gaugeMax = Math.max(S.thr*2, 120, Math.min(600, Math.max(...peaks.map(p=>p.v), 0) * 1.15));
+  el.gMark.style.left = Math.min(100, S.thr/gaugeMax*100).toFixed(1) + "%";
+  if (v === null){
+    el.eNow.textContent = present ? "—" : "사람 없음";
+    el.gFill.style.width = "0%"; el.gFill.classList.add("under");
+    el.ePeak.textContent = "—";
+    if (state === "run") el.stateText.textContent = present ? "운동중" : "프레임 밖";
+    return;
+  }
+  el.eNow.textContent = v.toFixed(0);
+  el.gFill.style.width = Math.min(100, v/gaugeMax*100).toFixed(1) + "%";
+  el.gFill.classList.toggle("under", v < S.thr);
+  el.gFill.style.background = state==="stop" ? "var(--stop)" : state==="warn" ? "var(--warn)" : "";
+  el.ePeak.textContent = peaks.length ? Math.max(...peaks.map(p=>p.v)).toFixed(0) : "—";
+  if (state === "run") el.stateText.textContent = present ? "운동중" : "프레임 밖";
+}
+
+/* ---------------- 경고음 ---------------- */
+function beep(){
+  if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = "square"; o.frequency.value = 880;
+  const t = ac.currentTime;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.16, t+0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+0.15);
+  o.connect(g); g.connect(ac.destination);
+  o.start(t); o.stop(t+0.17);
+}
+
+/* ---------------- 슬라이더 ---------------- */
+function bind(id, out, fn){
+  const i = $(id), o = $(out);
+  const run = () => { o.textContent = fn(parseFloat(i.value)); };
+  i.addEventListener("input", run); run();
+}
+bind("cThr","vThr", v => { S.thr = v; el.eThr.textContent = v; paintGauge(); return String(v); });
+bind("cWarn","vWarn", v => { S.warn = v; return v.toFixed(1)+"초"; });
+bind("cStop","vStop", v => { S.stop = v; return v.toFixed(1)+"초" + (v < S.warn+0.5 ? " ⚠" : ""); });
+bind("cInt","vInt",  v => { S.interval = v; return v + "프레임마다"; });
+bind("cPanel","vPanel", v => {
+  document.documentElement.style.setProperty("--panel-w", v+"%"); return v+"%"; });
+bind("cOver","vOver",  v => {
+  document.documentElement.style.setProperty("--overlap", v+"px"); return v+"px"; });
+
+/* ---------------- 탭 ---------------- */
+document.querySelectorAll(".tab").forEach((b) => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("on", x === b));
+    document.querySelectorAll("[data-p]").forEach((pane) => {
+      pane.hidden = pane.dataset.p !== b.dataset.t;
+    });
+    if (b.dataset.t === "vid") setTimeout(() => $("idInput").focus(), 0);
+  });
+});
+
+/* ---------------- 화면 꺼짐 방지 ---------------- */
+async function lockScreen(){
+  try {
+    if (!("wakeLock" in navigator)) return;
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch (_) { /* 거부/미지원이면 조용히 넘어간다 */ }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !wakeLock) lockScreen();
+});
+
+/* ---------------- 시작 ---------------- */
+el.startBtn.addEventListener("click", async () => {
+  el.startBtn.disabled = true;
+  el.gateErr.textContent = "";
+  const say = (t) => { el.startBtn.textContent = t; };
+  try {
+    try { ac = new (window.AudioContext || window.webkitAudioContext)(); await ac.resume(); } catch(_){}
+    say("카메라 여는 중…");  await initCamera();
+    say("모델 받는 중…");    await initModel();
+    say("플레이어 준비 중…"); await initPlayer();
+    buildVidButtons();
+    el.vidRow.firstElementChild?.classList.add("on");
+    lockScreen();
+    running = true; lastFpsT = lastTick = performance.now();
+    setState("run");
+    rafId = requestAnimationFrame(loop);
+    setInterval(tick, TICK_MS);
+    el.gate.remove();
+  } catch (err) {
+    el.startBtn.disabled = false;
+    say("다시 시도");
+    const n = err && err.name;
+    const cams = await camCount();
+    el.gateErr.textContent =
+      n === "NotAllowedError" ? "카메라 권한이 거부되었습니다. 주소창 자물쇠 → 권한에서 카메라를 허용해 주세요." :
+      n === "NotFoundError"   ? "카메라를 찾을 수 없습니다. 브라우저가 인식한 카메라 " + cams + "개. "
+          + "0개라면 윈도우 설정 → 개인 정보 및 보안 → 카메라에서 접근을 켜거나, 노트북의 카메라 차단 스위치/Fn 키를 확인하세요." :
+      n === "NotReadableError" ? "다른 앱이 카메라를 쓰고 있습니다. 줌·팀즈·카메라 앱을 모두 끄고 다시 시도하세요." :
+      (location.protocol !== "https:" && location.hostname !== "localhost")
+        ? "HTTPS 또는 localhost 에서만 카메라를 쓸 수 있습니다. 현재: " + location.protocol
+        : "시작 실패: " + (err && err.message ? err.message : String(err));
+  }
+});
+</script>
+</body>
+</html>
